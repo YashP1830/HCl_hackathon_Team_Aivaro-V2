@@ -1,17 +1,10 @@
-"""LangGraph RAG workflow for answering questions from the book catalogue.
-
-The graph deliberately treats SQL-stored book descriptions as the knowledge
-source: retrieve candidate books -> grade retrieval -> generate a grounded
-answer or a transparent not-found response. It is separate from the existing
-recommendation response contract so callers can adopt it without breaking UI.
-"""
+"""LangGraph RAG workflow for answering questions from the book catalogue."""
 from __future__ import annotations
 
 import json
 import logging
 from typing import Any, TypedDict
 
-import numpy as np
 from langgraph.graph import END, StateGraph
 from sqlalchemy.orm import Session
 
@@ -34,8 +27,7 @@ class RagState(TypedDict, total=False):
 
 
 def build_rag_graph(db: Session):
-    """Compile a small graph bound to the current request's SQLAlchemy session."""
-
+    """retrieve -> grade -> grounded generation or not-found fallback."""
     def retrieve(state: RagState) -> RagState:
         question = state["question"].strip()
         if not question:
@@ -45,48 +37,28 @@ def build_rag_graph(db: Session):
         context: list[dict[str, Any]] = []
         for hit in hits:
             book = repo.get_book(db, hit.book_id)
-            if book is None:
-                continue
-            context.append({
-                "id": str(book.id),
-                "title": book.title,
-                "author": book.author,
-                "description": book.description or "",
-                "genre": book.genre or "",
-                "publisher": book.publisher or "",
-                "score": float(hit.score),
-            })
-        best = max((item["score"] for item in context), default=0.0)
-        return {"context": context, "best_score": best}
+            if book is not None:
+                context.append({"id": str(book.id), "title": book.title, "author": book.author,
+                    "description": book.description or "", "genre": book.genre or "",
+                    "publisher": book.publisher or "", "score": float(hit.score)})
+        return {"context": context, "best_score": max((x["score"] for x in context), default=0.0)}
 
     def grade(state: RagState) -> str:
-        # Avoid calling the generator when retrieval produced no usable evidence.
         return "generate" if state.get("context") and state.get("best_score", 0.0) >= 0.12 else "not_found"
 
     def generate(state: RagState) -> RagState:
         context_json = json.dumps(state.get("context", []), ensure_ascii=False)
-        system = (
-            "You are the library's RAG assistant. Answer only from the supplied context. "
-            "If the context does not contain the answer, explicitly say you cannot determine it. "
-            "Never invent book details, stock, policies, or citations. Keep the answer concise."
-        )
-        user = f"Question: {state['question']}\nRetrieved catalogue context (JSON):\n{context_json}"
+        system = ("You are the library's RAG assistant. Answer only from the supplied context. "
+            "If the context does not contain the answer, say you cannot determine it. "
+            "Never invent book details, stock, policies, or citations. Keep the answer concise.")
+        user = f"Question: {state['question']}\nCatalogue context (JSON):\n{context_json}"
         answer = get_llm().complete(system, user, temperature=0.1).strip()
-        return {
-            "answer": answer,
-            "status": "answered" if answer else "not_found",
-            "sources": [
-                {"book_id": str(item["id"]), "title": str(item["title"])}
-                for item in state.get("context", [])
-            ],
-        }
+        return {"answer": answer, "status": "answered" if answer else "not_found",
+            "sources": [{"book_id": str(x["id"]), "title": str(x["title"])} for x in state.get("context", [])]}
 
     def not_found(state: RagState) -> RagState:
-        return {
-            "answer": "I couldn't find enough relevant information in the library catalogue to answer that confidently.",
-            "status": "not_found",
-            "sources": [],
-        }
+        return {"answer": "I couldn't find enough relevant information in the library catalogue to answer that confidently.",
+            "status": "not_found", "sources": []}
 
     graph = StateGraph(RagState)
     graph.add_node("retrieve", retrieve)
@@ -103,15 +75,8 @@ def answer_from_catalog(db: Session, question: str, top_k: int = 4) -> dict[str,
     """Run the graph and return JSON-friendly response data."""
     try:
         output = build_rag_graph(db).invoke({"question": question, "top_k": top_k})
-        return {
-            "answer": output.get("answer", ""),
-            "status": output.get("status", "not_found"),
-            "sources": output.get("sources", []),
-        }
+        return {"answer": output.get("answer", ""), "status": output.get("status", "not_found"), "sources": output.get("sources", [])}
     except Exception:
         logger.exception("RAG graph failed")
-        return {
-            "answer": "The library assistant encountered an error while searching the catalogue. Please try again.",
-            "status": "error",
-            "sources": [],
-        }
+        return {"answer": "The library assistant encountered an error while searching the catalogue. Please try again.",
+            "status": "error", "sources": []}
