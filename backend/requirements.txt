@@ -1,5 +1,4 @@
-# Exact, verified dependency set (frozen from a working install).
-# All packages have prebuilt wheels for Windows/macOS/Linux on Python 3.11-3.13.
+# Backend dependencies. Install with: python -m pip install -r requirements.txt
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -21,6 +20,7 @@ jiter==0.18.0
 jsonpatch==1.36
 jsonpointer==3.4
 langchain-core==1.7.0
+langchain-openai>=1.0.0,<2.0.0
 langchain-protocol==0.0.20
 langgraph==1.2.17
 langgraph-checkpoint==4.3.0
