@@ -22,8 +22,8 @@ def health(db: Session = Depends(get_db)):
         "status": "ok" if db_ok else "degraded",
         "database": "connected" if db_ok else "error",
         "providers": {
-            "llm": "openai" if settings.llm_enabled else "local-fallback",
-            "embeddings": "openai" if settings.embeddings_remote_enabled else "local-fallback",
+            "llm": "gemini" if settings.llm_enabled else "local-fallback",
+            "embeddings": "gemini" if settings.embeddings_remote_enabled else "local-fallback",
             "research": "serpapi" if settings.serpapi_enabled else "disabled-fallback",
             "email": "smtp" if settings.smtp_enabled else "outbox-file",
         },

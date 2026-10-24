@@ -47,8 +47,8 @@ async def lifespan(app: FastAPI):
 
     start_scheduler()
     logger.info("Startup complete. LLM=%s Embeddings=%s Research=%s Email=%s",
-                "openai" if settings.llm_enabled else "local",
-                "openai" if settings.embeddings_remote_enabled else "local",
+                "gemini" if settings.llm_enabled else "local",
+                "gemini" if settings.embeddings_remote_enabled else "local",
                 "serpapi" if settings.serpapi_enabled else "fallback",
                 "smtp" if settings.smtp_enabled else "outbox")
     yield

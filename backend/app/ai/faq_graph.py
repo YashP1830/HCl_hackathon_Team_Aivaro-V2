@@ -80,7 +80,13 @@ def _retrieve(db: Session, query: str) -> tuple[Optional[Faq], float]:
     best_faq = None
     best_score = -1.0
     try:
-        qvec = np.asarray(get_embeddings().embed(query), dtype=np.float32)
+        qvec = np.asarray(
+    get_embeddings().embed(
+        query,
+        task_type="QUESTION_ANSWERING",
+    ),
+    dtype=np.float32,
+)
         qn = np.linalg.norm(qvec)
     except Exception:
         qvec, qn = None, 0.0
@@ -129,7 +135,7 @@ def build_faq_graph(db: Session):
         original = state["question"]
         new_query = original
         llm = get_llm()
-        if llm.provider == "openai":
+        if llm.provider == "gemini":
             try:
                 new_query = llm.complete(
                     "You rephrase a user's library FAQ question to improve keyword retrieval. "

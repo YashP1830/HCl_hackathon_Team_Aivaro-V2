@@ -1,13 +1,4 @@
-
-"""LLM client.
-
-Primary: Google Gemini API.
-Fallback: deterministic local generator for offline FAQ,
-recommendations, and analytics narratives.
-
-Both providers expose the same methods, so callers never
-need to branch on the provider.
-"""
+"""Gemini LLM client with a local fallback."""
 
 from __future__ import annotations
 
@@ -23,27 +14,16 @@ logger = logging.getLogger("app.ai.llm")
 class LLMClient:
     def __init__(self) -> None:
         self.enabled = settings.llm_enabled
-        self.model = getattr(
-            settings, "llm_model", "gemini-2.5-flash"
-        )
+        self.model = settings.llm_model
         self._client = None
 
         if self.enabled:
             try:
                 from google import genai
 
-                api_key = (
-                    getattr(settings, "resolved_llm_api_key", None)
-                    or getattr(settings, "llm_api_key", None)
+                self._client = genai.Client(
+                    api_key=settings.resolved_gemini_api_key
                 )
-
-                if not api_key:
-                    raise ValueError(
-                        "Gemini API key is missing. "
-                        "Configure GEMINI_API_KEY or LLM_API_KEY."
-                    )
-
-                self._client = genai.Client(api_key=api_key)
 
             except Exception as exc:
                 logger.warning(
@@ -55,9 +35,11 @@ class LLMClient:
 
     @property
     def provider(self) -> str:
-        if self.enabled and self._client is not None:
-            return "gemini"
-        return "local"
+        return (
+            "gemini"
+            if self.enabled and self._client is not None
+            else "local"
+        )
 
     def complete(
         self,
@@ -66,17 +48,19 @@ class LLMClient:
         *,
         temperature: float = 0.3,
     ) -> str:
-        """Generate a text response using Gemini or local fallback."""
+        """Generate normal text."""
 
         if self.enabled and self._client is not None:
             try:
+                from google.genai import types
+
                 response = self._client.models.generate_content(
                     model=self.model,
                     contents=user,
-                    config={
-                        "system_instruction": system,
-                        "temperature": temperature,
-                    },
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=temperature,
+                    ),
                 )
 
                 return (response.text or "").strip()
@@ -97,24 +81,25 @@ class LLMClient:
         *,
         temperature: float = 0.2,
     ) -> Any:
-        """Generate and parse JSON, falling back locally on failure."""
+        """Generate JSON and parse it into a Python object."""
 
         if self.enabled and self._client is not None:
             try:
+                from google.genai import types
+
                 response = self._client.models.generate_content(
                     model=self.model,
                     contents=user,
-                    config={
-                        "system_instruction": (
+                    config=types.GenerateContentConfig(
+                        system_instruction=(
                             system + "\nReturn only valid JSON."
                         ),
-                        "response_mime_type": "application/json",
-                        "temperature": temperature,
-                    },
+                        temperature=temperature,
+                        response_mime_type="application/json",
+                    ),
                 )
 
-                content = response.text or "{}"
-                return json.loads(content)
+                return json.loads(response.text or "{}")
 
             except Exception as exc:
                 logger.warning(
@@ -125,138 +110,35 @@ class LLMClient:
 
         return self._local_json(system, user)
 
-    # ---------------- Local deterministic fallbacks ----------------
-
     def _local_complete(self, system: str, user: str) -> str:
         return (
-            "This explanation was generated locally because "
-            "the LLM API is unavailable. "
-            "Based on the provided information: "
+            "This explanation was generated locally because Gemini "
+            "is unavailable. Based on the provided information: "
             + user[:400]
         )
 
     def _local_json(self, system: str, user: str) -> Any:
-        """Local structured responses for supported use cases."""
-
         system_lower = system.lower()
 
-        if "recommend" in system_lower or "suggest" in system_lower:
-            return {
-                "suggestions": _local_book_suggestions(user)
-            }
-
-        if "analytics" in system_lower or "narrative" in system_lower:
+        if (
+            "analytics" in system_lower
+            or "narrative" in system_lower
+        ):
             return {
                 "narrative": (
-                    "Generated locally because the LLM API is "
-                    "unavailable. The metrics below are computed "
-                    "deterministically in Python."
+                    "Generated locally because Gemini is unavailable. "
+                    "The metrics below are computed deterministically "
+                    "in Python."
                 )
             }
 
+        if (
+            "recommend" in system_lower
+            or "suggest" in system_lower
+        ):
+            return {"suggestions": []}
+
         return {}
-
-
-def _local_book_suggestions(query: str) -> list[dict]:
-    """Return a small catalog of book recommendations offline."""
-
-    q = query.lower()
-
-    buckets: dict[str, list[dict]] = {
-        "generative ai": [
-            {
-                "book_name": "Deep Learning",
-                "author": (
-                    "Ian Goodfellow, Yoshua Bengio, "
-                    "Aaron Courville"
-                ),
-                "description": (
-                    "Foundational textbook covering deep neural networks."
-                ),
-            },
-            {
-                "book_name": "Generative Deep Learning",
-                "author": "David Foster",
-                "description": (
-                    "Practical guide to VAEs, GANs, and transformers."
-                ),
-            },
-        ],
-        "machine learning": [
-            {
-                "book_name": (
-                    "Hands-On Machine Learning with "
-                    "Scikit-Learn, Keras & TensorFlow"
-                ),
-                "author": "Aurélien Géron",
-                "description": (
-                    "Practical end-to-end guide to machine learning."
-                ),
-            },
-            {
-                "book_name": (
-                    "Pattern Recognition and Machine Learning"
-                ),
-                "author": "Christopher M. Bishop",
-                "description": (
-                    "Statistical machine learning methods."
-                ),
-            },
-        ],
-        "python": [
-            {
-                "book_name": "Fluent Python",
-                "author": "Luciano Ramalho",
-                "description": (
-                    "Writing idiomatic and effective Python."
-                ),
-            },
-            {
-                "book_name": "Python Crash Course",
-                "author": "Eric Matthes",
-                "description": (
-                    "Project-based introduction to Python."
-                ),
-            },
-        ],
-        "data": [
-            {
-                "book_name": "Designing Data-Intensive Applications",
-                "author": "Martin Kleppmann",
-                "description": (
-                    "Storage systems and distributed data processing."
-                ),
-            },
-            {
-                "book_name": "Python for Data Analysis",
-                "author": "Wes McKinney",
-                "description": (
-                    "Data analysis with pandas and NumPy."
-                ),
-            },
-        ],
-    }
-
-    for key, books in buckets.items():
-        if any(word in q for word in key.split()):
-            return books
-
-    return [
-        {
-            "book_name": "The Pragmatic Programmer",
-            "author": "Andrew Hunt, David Thomas",
-            "description": (
-                "Advice on software craftsmanship."
-            ),
-        },
-        {
-            "book_name": "Clean Code",
-            "author": "Robert C. Martin",
-            "description": (
-                "Principles for readable, maintainable code."
-            ),
-        },
-    ]
 
 
 _llm: LLMClient | None = None

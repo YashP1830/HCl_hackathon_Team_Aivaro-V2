@@ -4,7 +4,7 @@ Recommendation service.
 
 Flow:
 1. Validate the query and requested number of recommendations.
-2. Search the local catalog using embeddings and vector search.
+2. Search the local catalog using Gemini embeddings and vector search.
 3. Fetch book records and stock information from the database.
 4. Search Google through SerpAPI for additional book candidates.
 5. Extract candidate titles, authors, and descriptions from search results.
@@ -12,6 +12,11 @@ Flow:
 7. Match external candidates against the database.
 8. Set library_status and book_id using database records only.
 9. Return a consistent RecommendationResponse.
+
+Providers:
+- Embeddings: Google Gemini, with a local fallback when unconfigured.
+- External book search: SerpAPI Google Search.
+- LLM: Not used by this service.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ import os
 import re
 from typing import Any
 
-import serpapi
 from sqlalchemy.orm import Session
 
 from app.ai.embeddings import get_embeddings
@@ -58,11 +62,7 @@ def _dedupe_key(name: str, author: str) -> str:
 
 
 def _status_for_book(book: Any) -> str:
-    """
-    Calculate availability from the database.
-
-    Never trust external search results for stock information.
-    """
+    """Calculate availability using database stock information."""
     stock = getattr(book, "stock_quantity", 0) or 0
 
     if stock > 0:
@@ -82,6 +82,7 @@ def _get_serpapi_key() -> str | None:
         getattr(settings, "serpapi_api_key", None)
         or os.getenv("SERPAPI_API_KEY")
         or os.getenv("SERPAPI_KEY")
+        or None
     )
 
 
@@ -112,20 +113,20 @@ _LISTING_TITLE_PATTERNS = (
 
 
 def _clean_search_title(title: str) -> str:
-    """Remove common publisher/site suffixes without truncating subtitles."""
+    """Remove common site suffixes from search-result titles."""
 
     title = (title or "").strip()
     title = _SITE_SUFFIX_PATTERN.sub("", title)
+
     return title.strip(" \t\r\n-|–—")
 
 
 def _extract_author(title: str, snippet: str) -> str:
     """
-    Extract an author only when the search result provides a plausible name.
+    Extract an author only when a plausible author pattern is present.
 
-    Search result metadata is not guaranteed to contain an author.
-    If extraction is uncertain, return an empty string and let the
-    database matching step determine whether the title is in the catalog.
+    Search-result text is not authoritative bibliographic metadata.
+    An empty result means the author could not be reliably extracted.
     """
 
     patterns = [
@@ -150,6 +151,7 @@ def _extract_author(title: str, snippet: str) -> str:
 
             if match:
                 author = match.group(1).strip(" ,.-")
+
                 if author:
                     return author
 
@@ -166,14 +168,14 @@ def _search_external_books(
     already: list[str],
 ) -> list[dict[str, str]]:
     """
-    Search Google via SerpAPI for additional book candidates.
+    Search Google through SerpAPI for additional book candidates.
 
-    Returns dictionaries containing:
+    Returned dictionaries contain:
         book_name
         author
         description
 
-    This function does not assign library availability or database IDs.
+    This function never assigns database IDs or stock information.
     """
 
     query = (query or "").strip()
@@ -191,17 +193,26 @@ def _search_external_books(
         return []
 
     try:
-        client = serpapi.Client(
-            api_key=api_key,
-            timeout=15,
+        # Import lazily so the application can start even when the
+        # optional SerpAPI dependency has not been installed.
+        import serpapi
+
+        timeout = max(
+            1,
+            int(settings.serpapi_timeout_seconds),
         )
 
-        results = client.search(
-            engine="google",
-            q=f"books about {query} book author",
-            hl="en",
-            gl="in",
+        client = serpapi.Client(
+            api_key=api_key,
+            timeout=timeout,
         )
+
+        results = client.search({
+            "engine": "google",
+            "q": f"books about {query} book author",
+            "hl": "en",
+            "gl": "in",
+        })
 
         organic_results = results.get("organic_results", []) or []
 
@@ -215,17 +226,22 @@ def _search_external_books(
         seen_titles: set[str] = set()
 
         for result in organic_results:
-            raw_title = result.get("title", "")
-            snippet = (
-                result.get("snippet", "")
-                or result.get("snippet_highlighted_words", "")
-            )
+            if not isinstance(result, dict):
+                continue
 
-            # Some search result fields may not be plain strings.
+            raw_title = result.get("title", "")
+            snippet = result.get("snippet", "")
+
+            # Handle unexpected search-result field types safely.
             if not isinstance(raw_title, str):
                 continue
 
-            if not isinstance(snippet, str):
+            if isinstance(snippet, list):
+                snippet = " ".join(
+                    str(part)
+                    for part in snippet
+                )
+            elif not isinstance(snippet, str):
                 snippet = ""
 
             title = _clean_search_title(raw_title)
@@ -238,7 +254,7 @@ def _search_external_books(
             if not title_key:
                 continue
 
-            # Do not treat obvious book-list articles as individual books.
+            # Avoid returning general list articles as individual books.
             title_lower = title.lower()
 
             if any(
@@ -247,7 +263,7 @@ def _search_external_books(
             ):
                 continue
 
-            # Avoid results already present in the recommendation list.
+            # Remove titles that are already recommended or repeated.
             if title_key in existing_titles:
                 continue
 
@@ -256,15 +272,16 @@ def _search_external_books(
 
             author = _extract_author(title, snippet)
 
-            description = snippet.strip() or DESCRIPTION_FALLBACK
-
-            candidates.append(
-                {
-                    "book_name": title,
-                    "author": author,
-                    "description": description,
-                }
+            description = (
+                snippet.strip()
+                or DESCRIPTION_FALLBACK
             )
+
+            candidates.append({
+                "book_name": title,
+                "author": author,
+                "description": description,
+            })
 
             seen_titles.add(title_key)
 
@@ -272,7 +289,7 @@ def _search_external_books(
                 break
 
         logger.info(
-            "SerpAPI returned %d external book candidates for query=%r",
+            "SerpAPI returned %d book candidates for query=%r",
             len(candidates),
             query,
         )
@@ -280,7 +297,7 @@ def _search_external_books(
         return candidates
 
     except Exception:
-        # External search failure must not break the recommendation API.
+        # Search failures must not crash the recommendation endpoint.
         logger.exception(
             "SerpAPI book search failed for query=%r",
             query,
@@ -298,11 +315,10 @@ def recommend_books(
     top_k: int = 5,
 ) -> RecommendationResponse:
     """
-    Combine local vector-search matches with external search candidates.
+    Combine local catalog matches with external book suggestions.
 
-    Database values are authoritative for all books that match the
-    library catalog. External results never determine stock quantities
-    or invent database IDs.
+    Database records are authoritative for stock and book IDs.
+    External search results are never allowed to invent stock information.
     """
 
     query = (query or "").strip()
@@ -325,11 +341,17 @@ def recommend_books(
     seen_keys: set[str] = set()
 
     # ---------------------------------------------------------------
-    # 1. Search the local catalog using vector search
+    # 1. Search the local catalog using Gemini embeddings
     # ---------------------------------------------------------------
 
     try:
-        query_vector = get_embeddings().embed(query)
+        # Gemini retrieval uses different task types for documents
+        # and search queries. Stored book vectors should use
+        # RETRIEVAL_DOCUMENT.
+        query_vector = get_embeddings().embed(
+            query,
+            task_type="RETRIEVAL_QUERY",
+        )
 
         hits = search_books(
             db,
@@ -358,19 +380,25 @@ def recommend_books(
         if not book:
             continue
 
-        title = (getattr(book, "title", None) or "").strip()
+        title = (
+            getattr(book, "title", None) or ""
+        ).strip()
 
         if not title:
             continue
 
         author = (
-            getattr(book, "author", None) or AUTHOR_FALLBACK
+            getattr(book, "author", None)
+            or AUTHOR_FALLBACK
         ).strip()
 
         title_key = _norm(title)
         dedupe_key = _dedupe_key(title, author)
 
-        if title_key in seen_titles or dedupe_key in seen_keys:
+        if (
+            title_key in seen_titles
+            or dedupe_key in seen_keys
+        ):
             continue
 
         seen_titles.add(title_key)
@@ -397,12 +425,12 @@ def recommend_books(
             )
 
     # ---------------------------------------------------------------
-    # 2. Find additional books through SerpAPI
+    # 2. Search externally for additional recommendations
     # ---------------------------------------------------------------
 
-    remaining = max(0, top_k - len(items))
+    remaining = top_k - len(items)
 
-    if remaining == 0:
+    if remaining <= 0:
         return RecommendationResponse(
             query=query,
             recommendations=items[:top_k],
@@ -415,7 +443,7 @@ def recommend_books(
     )
 
     # ---------------------------------------------------------------
-    # 3. Deduplicate, match against DB, and construct response items
+    # 3. Deduplicate, match against DB, and build response items
     # ---------------------------------------------------------------
 
     for suggestion in suggestions:
@@ -444,7 +472,7 @@ def recommend_books(
         if candidate_key in seen_keys:
             continue
 
-        # Search the database before treating a result as external.
+        # Check the database before marking a book external.
         try:
             matched = _match_catalog(
                 db=db,
@@ -453,14 +481,15 @@ def recommend_books(
             )
         except Exception:
             logger.exception(
-                "Database matching failed for external title=%r",
+                "Database matching failed for title=%r",
                 name,
             )
             matched = None
 
         if matched is not None:
             matched_title = (
-                getattr(matched, "title", None) or name
+                getattr(matched, "title", None)
+                or name
             ).strip()
 
             matched_author = (
@@ -474,7 +503,6 @@ def recommend_books(
                 matched_author,
             )
 
-            # A previously emitted catalog book should not appear twice.
             if (
                 matched_title_key in seen_titles
                 or matched_key in seen_keys
@@ -496,8 +524,8 @@ def recommend_books(
             seen_keys.add(matched_key)
 
         else:
-            # No authoritative database record was found.
-            # Do not invent IDs or claim that the library stocks it.
+            # No matching database record: the book is external.
+            # Do not invent a book ID or claim library availability.
             external_author = raw_author or AUTHOR_FALLBACK
 
             item = RecommendationItem(
@@ -532,15 +560,14 @@ def _match_catalog(
     author: str,
 ):
     """
-    Match an external result against the local database.
+    Match an external search result against the local database.
 
-    Matching policy:
-    - Titles must match after normalization.
-    - If the author is known, it must also match the database author.
-    - If the author is unknown, an exact normalized title match is
-      sufficient to retrieve authoritative database information.
-    - Do not match a known, conflicting author just because the title
-      is the same.
+    Rules:
+    - Normalized titles must match exactly.
+    - If the search result identifies an author, it must be consistent
+      with the database author.
+    - If no author is identified, an exact title match is sufficient.
+    - A conflicting known author must not be ignored.
     """
 
     target_title = _norm(name)
@@ -553,7 +580,7 @@ def _match_catalog(
     if target_author == _norm(AUTHOR_FALLBACK):
         target_author = ""
 
-    # This small-catalog approach matches the existing repository API.
+    # Use the existing repository interface for portability across DBs.
     books, _ = repo.list_books(
         db,
         q=None,
@@ -573,15 +600,15 @@ def _match_catalog(
             getattr(book, "author", None)
         )
 
-        # Author was not provided by search, so use the exact title match.
+        # Unknown external author: exact title match is sufficient.
         if not target_author:
             return book
 
-        # If the DB author is missing, the exact title can still be useful.
+        # Database author is missing; use exact title match.
         if not book_author:
             return book
 
-        # Require a reasonably consistent author match.
+        # When both are known, require a consistent author match.
         if (
             target_author == book_author
             or target_author in book_author

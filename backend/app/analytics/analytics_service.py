@@ -154,7 +154,7 @@ def _narrative(totals: dict, top_books: list[dict], from_date: str, to_date: str
         narrative = (data.get("narrative") if isinstance(data, dict) else None) or ""
         narrative = narrative.strip()
         if narrative:
-            return narrative, llm.provider == "openai"
+            return narrative, llm.provider == "gemini"
     except Exception:
         logger.exception("LLM narrative failed")
 
