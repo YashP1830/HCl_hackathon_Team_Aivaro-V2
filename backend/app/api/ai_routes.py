@@ -1,12 +1,11 @@
-"""AI endpoint wrappers (KT 4.1 / 4.3 / 4.4). These call the Member C services;
-the route layer stays thin."""
+"""Thin HTTP wrappers around the LangGraph-backed AI services."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.ai.faq_graph import answer_faq
-from app.ai.recommendations import recommend_books
+from app.ai.recommendation_graph import recommend_via_graph
 from app.ai.research import search_research_papers
 from app.db.session import get_db
 from app.schemas.schemas import (
@@ -23,7 +22,8 @@ router = APIRouter(tags=["ai"])
 
 @router.post("/recommendations", response_model=RecommendationResponse)
 def recommendations(body: RecommendationRequest, db: Session = Depends(get_db)):
-    return recommend_books(db, body.query, top_k=body.top_k)
+    # Graph wrapper preserves the existing recommendation JSON schema.
+    return recommend_via_graph(db, body.query, top_k=body.top_k)
 
 
 @router.post("/chat/faq", response_model=FaqResponse)
